@@ -1,0 +1,20 @@
+spacy
+pandas
+kagglehub
+qdrant-client
+neo4j
+google-cloud-aiplatform
+opentelemetry-api
+opentelemetry-sdk
+rank-bm25
+langchain
+scikit-learn
+scipy
+numpy
+tqdm
+streamlit
+langchain-text-splitters==0.3.27
+polars
+# dev tools
+black
+isort

@@ -1,0 +1,70 @@
+# For more info about the pyproject.toml file, see:
+# https://xebia.com/blog/an-updated-guide-to-setuptools-and-pyproject-toml/
+
+# Run `pip install -e ".[dev]"` to install with dev dependencies.
+
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fdmg-rag"
+dependencies = [
+    "google-cloud-aiplatform==1.55.0",
+    "google-cloud-logging==3.10.0",
+    "opentelemetry-api==1.25.0",
+    "opentelemetry-sdk==1.25.0",
+    "opentelemetry-exporter-gcp-trace==1.6.0",
+    "opentelemetry-instrumentation-logging==0.46b0",
+    "opentelemetry-exporter-gcp-monitoring==1.6.0a0",
+    "datasets>=2.20.0",
+    "pandas>=2.2.2",
+    "python-dotenv>=1.0.1",
+    "instructor[vertexai]==1.3.3",
+    "pydantic==2.7.4",
+    "rich==13.7.1",
+    "rouge==1.0.1",
+    "nltk==3.8.1",
+    "structlog==24.4.0",
+    "streamlit>=1.50.0",
+    "streamlit-extras>=0.6.0",
+    "ipython>=8.37.0",
+    "jupyter>=1.1.1",
+    "ipywidgets>=8.1.7",
+]
+dynamic = ["version"]
+requires-python = ">=3.12,<3.13"
+authors = [
+    {name = "Bing Tan", email = "bing.tan@xebia.com"},
+]
+description = "RAG integrated with Qdrant & Neo4j"
+readme = "README.md"
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel>=6.29.4",
+    "ipywidgets>=8.1.3",
+    "ipython>=6.2,<9",
+    "pytest==8.2.2",
+    "pre-commit==3.7.1",
+    "ruff==0.4.9",
+]
+
+[tool.ruff]
+line-length = 100
+lint.select = ["I"]
+src = ["src"]
+
+[tool.black]
+line-length = 100
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests"
+]
+
+filterwarnings = [
+    "ignore:Importing 'parser.split_arg_string' is deprecated:DeprecationWarning",
+    "ignore:Type google._upb._message.*:DeprecationWarning",
+    "ignore:PydanticDeprecatedSince20:DeprecationWarning"
+]
