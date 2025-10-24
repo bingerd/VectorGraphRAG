@@ -106,7 +106,7 @@ async def process_article(model, embedding_model, database, driver, row, embed_b
 
     except Exception as e:
         logger.info(f"⚠️ Error ingesting article '{row.get("title", "Untitled")}': {e}")
-        traceback.logger.info_exc()
+        traceback.print_exc()
         return False
 
 

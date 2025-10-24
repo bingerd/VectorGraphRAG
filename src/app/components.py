@@ -3,13 +3,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
-import spacy
 from neo4j import Driver, GraphDatabase
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import FieldCondition, Filter, MatchValue
 from rank_bm25 import BM25Okapi
 from vertexai.generative_models import GenerativeModel
 from vertexai.preview.language_models import TextEmbeddingModel
+
+from pipelines.ner_inference import extract_entities_and_relations
 
 import logging
 
@@ -39,15 +40,12 @@ def trace(event: str, start_time: float, data=None):
 # ===================================================
 # Config constants
 # ===================================================
-MAX_CONTEXT_CHARS = 8000
-TOP_K_CHUNKS = 10  # number of chunks returned by vector search
-TOP_K_ARTICLES = 10  # how many article ids to consider from KG
+MAX_CONTEXT_CHARS = 6000
+TOP_K_CHUNKS = 5  # number of chunks returned by vector search
+TOP_K_ARTICLES = 5  # how many article ids to consider from KG
 MAX_ENTITIES = 10
-MAX_RELATIONS = 20
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "")
-
-nlp = spacy.load("en_core_web_sm")
-
+MAX_RELATIONS = 10
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "news")
 
 # ===================================================
 # Helper functions
@@ -57,34 +55,6 @@ def embed_text(model: TextEmbeddingModel, text: str) -> list:
     embedding = model.get_embeddings([text])[0].values
     trace("Embedding", t0, {"text_len": len(text), "vector_dim": len(embedding)})
     return embedding
-
-
-def extract_entities_and_relations(text: str):
-    """Extract entities from text (used only for parsing query text here)."""
-    t0 = time.time()
-    doc = nlp(text)
-    entities = [{"name": ent.text, "type": ent.label_} for ent in doc.ents]
-    # lightweight relation extraction (not used heavily here)
-    relations = []
-    for sent in doc.sents:
-        subj = [tok for tok in sent if tok.dep_ in ("nsubj", "nsubjpass")]
-        obj = [tok for tok in sent if tok.dep_ in ("dobj", "pobj")]
-        verb = [tok for tok in sent if tok.pos_ == "VERB"]
-        if subj and obj and verb:
-            relations.append(
-                {
-                    "subject": subj[0].text,
-                    "predicate": verb[0].lemma_.upper().replace(" ", "_"),
-                    "object": obj[0].text,
-                    # "metadata": {"confidence": 0.8}
-                }
-            )
-    trace(
-        "Entity & relation extraction (query)",
-        t0,
-        {"entities": len(entities), "relations": len(relations)},
-    )
-    return entities, relations
 
 
 def bm25_entity_ranking(query: str, entities: list[dict], max_entities=10):
@@ -111,10 +81,10 @@ def format_chunk_payload(payload: dict, query: str, relations: list[dict] = None
     relations: list of relation dicts relevant to the parent article
     """
     entities = payload.get("entities", []) or []
-    if query:
-        entities = bm25_entity_ranking(query, entities, MAX_ENTITIES)
-    else:
-        entities = entities[:MAX_ENTITIES]
+    # if query:
+    #     entities = bm25_entity_ranking(query, entities, MAX_ENTITIES)
+    # else:
+    #     entities = entities[:MAX_ENTITIES]
     entity_names = ", ".join([e["name"] for e in entities])
 
     # filter relations for this article (if provided)
@@ -136,8 +106,8 @@ def format_chunk_payload(payload: dict, query: str, relations: list[dict] = None
 
     # Keep chunk content reasonably short: truncate if necessary
     content = payload.get("content", "")
-    if len(content) > 2000:
-        content = content[:2000] + "\n[TRUNCATED]"
+    # if len(content) > 2000:
+    #     content = content[:2000] + "\n[TRUNCATED]"
 
     block = f"{title} {date}\n" f"{author} | {publication}\n" f"{content}\n"
     if entity_names:
@@ -302,7 +272,29 @@ def fetch_and_build_context(
 
     return "\n\n".join(context_parts)
 
+def kg_query(driver, query_entities):
+    names = [ent["name"] for ent in query_entities]
+    return kg_query_articles_by_entities(driver=driver, entity_names=names)
 
+def rank_relations(query: str, relations: list[dict], max_relations=5):
+    if not relations:
+        return []
+
+    # Combine subject + predicate + object as a text string
+    relation_texts = [f"{r['subject']} {r['predicate']} {r['object']}" for r in relations]
+
+    # Simple BM25 ranking
+    tokenized_relations = [text.lower().split() for text in relation_texts]
+    bm25 = BM25Okapi(tokenized_relations)
+    query_tokens = query.lower().split()
+    scores = bm25.get_scores(query_tokens)
+
+    scored_relations = list(zip(scores, relations))
+    scored_relations.sort(reverse=True, key=lambda x: x[0])
+    top_relations = [r for s, r in scored_relations if s > 0][:max_relations]
+    return top_relations
+
+    
 # ===================================================
 # Main query pipeline (vector search over chunks + KG)
 # ===================================================
@@ -316,25 +308,18 @@ def query_system(
     total_start = time.time()
 
     # --- Extract query entities ---
-    t0 = time.time()
-    query_entities, _ = extract_entities_and_relations(query)
-    trace("Extract query entities", t0, {"entities": query_entities})
+    query_entities, _ = extract_entities_and_relations(generative_model, text=query)
+    trace("Extract query entities", time.time(), {"entities": query_entities})
 
     # --- Parallel KG traversal (article ids) + embedding ---
-    def kg_query():
-        names = [ent["name"] for ent in query_entities]
-        return kg_query_articles_by_entities(driver=driver, entity_names=names)
-
-    t0 = time.time()
     with ThreadPoolExecutor() as executor:
-        kg_future = executor.submit(kg_query)
+        kg_future = executor.submit(kg_query, driver, query_entities)
         emb_future = executor.submit(embed_text, model=embedding_model, text=query)
         candidate_article_ids = kg_future.result()
         query_embedding = emb_future.result()
-    trace("Neo4j KG traversal + Embedding", t0, {"articles_found": len(candidate_article_ids)})
+    trace("Neo4j KG traversal + Embedding", time.time(), {"articles_found": len(candidate_article_ids)})
 
     # --- Vector DB search (chunk-level) ---
-    t0 = time.time()
     try:
         vector_results = database.search(
             collection_name=COLLECTION_NAME,
@@ -345,7 +330,7 @@ def query_system(
     except Exception as e:
         logger.info(f"⚠️ Qdrant vector search failed: {e}")
         vector_results = []
-    trace("Qdrant vector search (chunks)", t0, {"hits": len(vector_results)})
+    trace("Qdrant vector search (chunks)", time.time(), {"hits": len(vector_results)})
 
     # Collect article_ids from chunk hits and preserve ordering (vector hits prioritized)
     vector_article_ids_ordered = []
@@ -364,7 +349,7 @@ def query_system(
             :TOP_K_ARTICLES
         ]
     )
-    trace("Combine KG + vector article ids", t0, {"combined": len(combined_article_ids)})
+    trace("Combine KG + vector article ids", time.time(), {"combined": len(combined_article_ids)})
 
     # --- Build context: prefer vector-returned chunks first, then KG-based chunks ---
     t0 = time.time()
@@ -395,69 +380,75 @@ def query_system(
         total_len += len(chunk_block)
 
     # If we still have room, fetch more chunks for KG-derived articles not already covered by vector hits
-    remaining_article_ids = [
-        aid
-        for aid in combined_article_ids
-        if aid not in {r.payload.get("article_id") for r in vector_chunk_records}
-    ]
-    if remaining_article_ids and total_len < MAX_CONTEXT_CHARS:
-        # fetch additional chunks via fetch_and_build_context but only for remaining_article_ids
-        extra_context = fetch_and_build_context(
-            driver=driver,
-            database=database,
-            combined_article_ids=remaining_article_ids,
-            query=query,
-        )
-        if extra_context:
-            # ensure we don't exceed MAX_CONTEXT_CHARS
-            if total_len + len(extra_context) > MAX_CONTEXT_CHARS:
-                extra_context = extra_context[: (MAX_CONTEXT_CHARS - total_len)] + "\n[TRUNCATED]"
-            context_parts.append(extra_context)
-            total_len += len(extra_context)
+    # remaining_article_ids = [
+    #     aid
+    #     for aid in combined_article_ids
+    #     if aid not in {r.payload.get("article_id") for r in vector_chunk_records}
+    # ]
+    # if remaining_article_ids and total_len < MAX_CONTEXT_CHARS:
+    #     # fetch additional chunks via fetch_and_build_context but only for remaining_article_ids
+    #     extra_context = fetch_and_build_context(
+    #         driver=driver,
+    #         database=database,
+    #         combined_article_ids=remaining_article_ids,
+    #         query=query,
+    #     )
+    #     if extra_context:
+    #         # ensure we don't exceed MAX_CONTEXT_CHARS
+    #         if total_len + len(extra_context) > MAX_CONTEXT_CHARS:
+    #             extra_context = extra_context[: (MAX_CONTEXT_CHARS - total_len)] + "\n[TRUNCATED]"
+    #         context_parts.append(extra_context)
+    #         total_len += len(extra_context)
 
     context_text = "\n\n".join(context_parts)
-    trace("Build context text", t0, {"context_len": len(context_text)})
+    trace("Build context text", time.time(), {"context_len": len(context_text)})
 
     # --- Generate final response ---
-    t0 = time.time()
     # Structured prompt: separate "Relevant snippets" and "Entity/relations summary"
     entity_summary_lines = []
     for aid in combined_article_ids:
         rels = relations_by_article.get(aid, [])
         if not rels:
             continue
+
         # compact summary per article (max few relations)
-        rels_short = rels[:5]
-        s = f"Article {aid}: " + "; ".join(
+        rels_short = rank_relations(query, rels, max_relations=10)
+        s = f"\nArticle {aid}: " + "; ".join(
             [f"{r['subject']} -[{r['predicate']}]-> {r['object']}" for r in rels_short]
         )
         entity_summary_lines.append(s)
     entity_summary = "\n".join(entity_summary_lines)
 
     full_query = (
-        """
-    You are a retrieval-augmented assistant with two data sources:
-    1. Knowledge graph facts (entity relationships)
-    2. Document snippets (retrieved by semantic similarity)
+    """
+    SYSTEM:
+    You are a retrieval-augmented assistant. You MUST only use the information present in the "Knowledge graph" section and the "Document snippets" section below. Do NOT use outside information or world knowledge.
 
-    Use only this information to answer the query.
-    If the answer isn’t explicitly supported, say:
-    "I don’t know based on the provided information."
+    OUTPUT FORMAT:
+    Return strictly valid JSON with keys:
+    
+    "answer": "<concise answer string or null>",
+    "explanation": "<1-2 sentence explanation or null>",
+    "evidence": [
+    "article_id": "<id>", "chunk_id": <int>, "excerpt": "<<=200 chars>", "kg_relation": "<optional triple or null>"
+    ],
+    "confidence": "<low|medium|high>"
+    
 
-    User query:
+    If the information is insufficient to answer, return:
+    "answer": null, "explanation": "Insufficient evidence", "evidence": [], "confidence":"low"
+
+    USER QUERY:
     {query}
 
-    Knowledge graph facts (triplet form):
+    KNOWLEDGE GRAPH (triples, with node ids):
     {entity_summary}
 
     Document snippets (ranked by relevance):
     {context_text}
 
-    Respond concisely in this format:
-    Answer: <factual answer>
-    Evidence:
-    - <doc title / author / publication> \n
-    - <relevant KG relation> \n
+    TASK:
+    Answer the user query based only on the above. For every factual claim include at least one 'evidence' item pointing to a snippet. Keep the answer concise (max 2 sentences). Set 'confidence' based on coverage: high if multiple snippets + KG agree, medium if single snippet supports, low otherwise.
     """
     ).format(query=query, entity_summary=entity_summary, context_text=context_text)
 
@@ -468,7 +459,7 @@ def query_system(
         logger.info(f"⚠️ LLM generation failed: {e}")
         llm_text = "Error generating response."
 
-    trace("Gemini LLM generation", t0, {"response_len": len(llm_text)})
+    trace("Gemini LLM generation", time.time(), {"response_len": len(llm_text)})
 
     trace("Total query runtime", total_start)
     return llm_text, full_query

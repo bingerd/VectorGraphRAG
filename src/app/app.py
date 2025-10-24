@@ -3,7 +3,7 @@ import os
 
 import streamlit as st
 import vertexai
-from components import query_system
+from app.components import query_system
 # Local DB clients
 from neo4j import GraphDatabase
 from qdrant_client import QdrantClient
@@ -49,11 +49,18 @@ def chatbot():
     st.title("Reasoning over News Articles")
     user_question = st.text_input("Enter your question about global news:")
     if user_question:
+        expansion_prompt = f"""
+        Expand and rephrase the following news-related question to improve information retrieval.
+        Keep it concise and factual, and return only the expanded text:
+
+        Question: "{user_question}"
+        """
+        expanded_query = model.generate_content(expansion_prompt).text.strip()
         answer, full_query = query_system(
             generative_model=model,
             embedding_model=embedding_model,
             database=qdrant,
-            query=user_question,
+            query=expanded_query,
             driver=driver,
         )
         st.subheader("Answer:")

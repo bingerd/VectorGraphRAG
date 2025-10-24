@@ -49,7 +49,7 @@ def test_rag_self_eval_grounded():
     collection_name = random.choice(collections).name
     points, _ = qdrant.scroll(collection_name=collection_name, limit=10)
     sample_texts = [p.payload.get("content", "") for p in points if p.payload]
-    context_text = "\n".join(random.sample(sample_texts, 10)) or "No usable context found."
+    context_text = "\n".join(sample_texts or "No usable context found.")
 
     # =====================================================
     # Generate grounded question-answer pair from LLM
